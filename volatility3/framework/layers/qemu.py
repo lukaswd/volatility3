@@ -38,6 +38,8 @@ class QemuSuspendLayer(segmented.NonLinearlySegmentedLayer):
     SEGMENT_FLAG_XBZRLE = 0x40
     SEGMENT_FLAG_HOOK = 0x80
 
+    ENCODING_FLAG_XBZRLE = 0x01
+
     # See https://qemu.readthedocs.io/en/latest/devel/memory.html for more info
     #
     # At least the following values could occur for devices using > 3-4 GB RAM:
@@ -92,6 +94,8 @@ class QemuSuspendLayer(segmented.NonLinearlySegmentedLayer):
         self._configuration = None
         self._architecture = None
         self._compressed: Set[int] = set()
+        self._xbzrle: Set[int] = set()
+        self._xbzrle_segments: List[Tuple[int, int, int]] = []
         self._current_segment_name = b""
         self._pci_hole_start = 0
         self._pci_hole_end = 0
@@ -202,7 +206,7 @@ class QemuSuspendLayer(segmented.NonLinearlySegmentedLayer):
                     )
                     self._pci_hole_start, self._pci_hole_end = 0, 0
 
-            if flags & (self.SEGMENT_FLAG_COMPRESS | self.SEGMENT_FLAG_PAGE):
+            if flags & (self.SEGMENT_FLAG_COMPRESS | self.SEGMENT_FLAG_PAGE | self.SEGMENT_FLAG_XBZRLE):
                 if not (flags & self.SEGMENT_FLAG_CONTINUE):
                     namelen = self._context.object(
                         self._qemu_table_name + constants.BANG + "unsigned char",
@@ -216,14 +220,23 @@ class QemuSuspendLayer(segmented.NonLinearlySegmentedLayer):
                         segments.append((addr, index, page_size, 1))
                         self._compressed.add(addr)
                     index += 1
+                elif flags & self.SEGMENT_FLAG_XBZRLE:
+                    xbzrle_flags = base_layer.read(index, 1)[0]
+                    xbzrle_payload_len = struct.unpack(">H", base_layer.read(index + 1, 2))[0]
+                    index += 3
+
+                    if not xbzrle_flags & self.ENCODING_FLAG_XBZRLE:
+                        raise exceptions.LayerException(
+                            self.name, "XBZRLE flag does not match expected value"
+                        )
+
+                    self._xbzrle_segments.append((addr, index, xbzrle_payload_len))
+                    self._xbzrle.add(addr)
+                    index += xbzrle_payload_len
                 else:
                     if self._current_segment_name == b"pc.ram":
                         segments.append((addr, index, page_size, page_size))
                     index += page_size
-            if flags & self.SEGMENT_FLAG_XBZRLE:
-                raise exceptions.LayerException(
-                    self.name, "XBZRLE compression not supported"
-                )
             if flags & self.SEGMENT_FLAG_EOS:
                 done = True
         return segments, index
@@ -459,6 +472,31 @@ class QemuSuspendLayer(segmented.NonLinearlySegmentedLayer):
             index += 8 + section_len
         return index
 
+    def _read_uleb128(self, buf: bytes, i: int) -> tuple[int, int]:
+        shift = 0
+        value = 0
+        while True:
+            b = buf[i]
+            i += 1
+            value |= (b & 0x7f) << shift
+            if (b & 0x80) == 0:
+                return value, i
+            shift += 7
+
+    def _xbzrle_apply(self, old_page: bytes, payload: bytes) -> bytes:
+        out = bytearray(old_page)
+        pos = 0
+        i = 0
+        while i < len(payload):
+            zrun, i = self._read_uleb128(payload, i)
+            pos += zrun
+            nzrun, i = self._read_uleb128(payload, i)
+            for _ in range(nzrun):
+                out[pos] ^= payload[i]
+                i += 1
+                pos += 1
+        return bytes(out)
+
     def _decode_data(
         self, data: bytes, mapped_offset: int, offset: int, output_length: int
     ) -> bytes:
@@ -474,6 +512,13 @@ class QemuSuspendLayer(segmented.NonLinearlySegmentedLayer):
         start_offset = offset ^ (offset & (page_size - 1))
         if start_offset in self._compressed:
             data = data * page_size
+        elif start_offset in self._xbzrle:
+            base_layer = self.context.layers[self._base_layer]
+            for x_segment in self._xbzrle_segments:
+                if x_segment[0] == start_offset:
+                    xbzrle_data = base_layer.read(x_segment[1], x_segment[2])
+
+                    data = self._xbzrle_apply(data, xbzrle_data)
         result = data[offset - start_offset : output_length + offset - start_offset]
         return result
 
