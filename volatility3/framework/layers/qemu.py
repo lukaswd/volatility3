@@ -540,7 +540,7 @@ class QemuSuspendLayer(segmented.NonLinearlySegmentedLayer):
             pos += zrun
             nzrun, i = self._read_uleb128(payload, i)
             for _ in range(nzrun):
-                out[pos] ^= payload[i]
+                out[pos] = payload[i]
                 i += 1
                 pos += 1
         return bytes(out)
