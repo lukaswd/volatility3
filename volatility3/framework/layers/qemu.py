@@ -30,13 +30,14 @@ class QemuSuspendLayer(segmented.NonLinearlySegmentedLayer):
     QEVM_SECTION_FOOTER = 0x7E
     HASH_PTE_SIZE_64 = 16
 
-    SEGMENT_FLAG_COMPRESS = 0x02
+    SEGMENT_FLAG_ZERO = 0x02
     SEGMENT_FLAG_MEM_SIZE = 0x04
     SEGMENT_FLAG_PAGE = 0x08
     SEGMENT_FLAG_EOS = 0x10
     SEGMENT_FLAG_CONTINUE = 0x20
     SEGMENT_FLAG_XBZRLE = 0x40
     SEGMENT_FLAG_HOOK = 0x80
+    SEGMENT_FLAG_COMPRESS = 0x100
 
     ENCODING_FLAG_XBZRLE = 0x01
 
@@ -206,7 +207,7 @@ class QemuSuspendLayer(segmented.NonLinearlySegmentedLayer):
                     )
                     self._pci_hole_start, self._pci_hole_end = 0, 0
 
-            if flags & (self.SEGMENT_FLAG_COMPRESS | self.SEGMENT_FLAG_PAGE | self.SEGMENT_FLAG_XBZRLE):
+            if flags & (self.SEGMENT_FLAG_ZERO | self.SEGMENT_FLAG_PAGE | self.SEGMENT_FLAG_XBZRLE | self.SEGMENT_FLAG_COMPRESS):
                 if not (flags & self.SEGMENT_FLAG_CONTINUE):
                     namelen = self._context.object(
                         self._qemu_table_name + constants.BANG + "unsigned char",
@@ -215,7 +216,7 @@ class QemuSuspendLayer(segmented.NonLinearlySegmentedLayer):
                     )
                     self._current_segment_name = base_layer.read(index + 1, namelen)
                     index += 1 + namelen
-                if flags & self.SEGMENT_FLAG_COMPRESS:
+                if flags & self.SEGMENT_FLAG_ZERO:
                     if self._current_segment_name == b"pc.ram":
                         segments.append((addr, index, page_size, 1))
                         self._compressed.add(addr)
@@ -233,6 +234,11 @@ class QemuSuspendLayer(segmented.NonLinearlySegmentedLayer):
                     self._xbzrle_segments.append((addr, index, xbzrle_payload_len))
                     self._xbzrle.add(addr)
                     index += xbzrle_payload_len
+                elif flags & self.SEGMENT_FLAG_COMPRESS:
+                    compressed_len = struct.unpack(
+                        ">I", base_layer.read(index, 4)
+                    )[0]
+                    index += 4 + compressed_len
                 else:
                     if self._current_segment_name == b"pc.ram":
                         segments.append((addr, index, page_size, page_size))
@@ -251,6 +257,7 @@ class QemuSuspendLayer(segmented.NonLinearlySegmentedLayer):
         section_info = dict()
         current_section_id = -1
         arch_detected = False
+        ram_section_complete = False
         while section_byte != self.QEVM_EOF and index <= base_layer.maximum_address:
             if index > 20 and not arch_detected:
                 # We're past where the QEVM_CONFIGURATION might be, so set the values
@@ -354,24 +361,65 @@ class QemuSuspendLayer(segmented.NonLinearlySegmentedLayer):
                 )
                 current_section_id = section_id
                 index += 4
-                # Read additional data
+
+                if section_id not in section_info:
+                    raise exceptions.LayerException(
+                        self.name,
+                        "QEMU PART/END references unknown section: "
+                        f"section_id={section_id}, "
+                        f"known_sections={list(section_info.keys())}",
+                    )
+
+                name = section_info[section_id]["name"]
                 index = self.extract_data(
                     index,
-                    section_info[current_section_id]["name"],
-                    section_info[current_section_id]["version_id"],
+                    name,
+                    version_id = section_info[section_id]["version_id"],
                 )
+
+                #
+                # RAM SECTION_END means all migration RAM has now been read.
+                #
+                if (
+                    section_byte == self.QEVM_SECTION_END
+                    and name == "ram"
+                ):
+                    ram_section_complete = True
+                    vollog.log(
+                        constants.LOGLEVEL_VV,
+                        "Final QEMU RAM section completed at 0x%x; "
+                        "waiting for matching footer",
+                        index,
+                    )
             elif section_byte == self.QEVM_SECTION_FOOTER:
                 section_id = self.context.object(
                     self._qemu_table_name + constants.BANG + "unsigned long",
                     offset=index,
                     layer_name=self._base_layer,
                 )
+
                 index += 4
                 if section_id != current_section_id:
                     raise exceptions.LayerException(
                         self._name,
-                        f"QEMU section footer mismatch: {current_section_id} and {section_id}",
+                        "QEMU section footer mismatch: "
+                        f"expected={current_section_id}, "
+                        f"found={section_id}, "
+                        #f"footer_offset=0x{section_offset:x}",
                     )
+
+                #
+                # Volatility only needs physical RAM.
+                # Once the final RAM END + footer has been consumed,
+                # device migration state is irrelevant.
+                #
+                if ram_section_complete:
+                    vollog.log(
+                        constants.LOGLEVEL_VV,
+                        "Final RAM footer successfully validated at 0x%x. "
+                        "Stopping QEMU migration parsing before device state.",
+                    )
+                    break
             elif section_byte == self.QEVM_EOF:
                 pass
             else:
